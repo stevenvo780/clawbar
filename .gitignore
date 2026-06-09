@@ -1,0 +1,27 @@
+# clawbar — never commit secrets or runtime artifacts.
+
+# real config (may contain machine-specific paths / container names)
+clawbar.env
+*.env
+!clawbar.env.example
+!*.env.example
+
+# runtime / generated
+*.state
+clawbar.state
+*.wav
+*.recpid
+*.vadpid
+*.png
+
+# backups
+*.bak
+*.bak-*
+*.bak-clawbar-*
+
+# editor / os
+*.swp
+*~
+.DS_Store
+__pycache__/
+*.pyc

@@ -1,0 +1,26 @@
+// clawbar — waybar module definition.
+//
+// Merge the "custom/claw" entry below into your modules file (the object that
+// holds your module definitions, e.g. ~/.config/waybar/modules.jsonc) and add
+// "custom/claw" to a visible modules array (e.g. "modules-right") in your bar.
+//
+// install.sh does this for you with a backup. The on-click commands are
+// rewritten by install.sh to point at your real launchers; the values here are
+// sensible defaults.
+//
+// "signal": 8 must match CLAWBAR_WAYBAR_SIGNAL in clawbar.env (waybar listens
+// on SIGRTMIN+8; claw-talk fires `pkill -RTMIN+8 waybar` on every state change
+// so the icon updates instantly instead of waiting for the poll interval).
+{
+  "custom/claw": {
+    "format": "{}",
+    "return-type": "json",
+    "exec": "clawbar-status",
+    "interval": 2,
+    "signal": 8,
+    "tooltip": true,
+    "on-click":        "claw-talk toggle",
+    "on-click-right":  "chat-claw.sh",
+    "on-click-middle": "kitty bash -lc \"docker exec -it claw openclaw tui\""
+  }
+}

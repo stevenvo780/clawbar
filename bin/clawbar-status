@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# clawbar-status — waybar custom module for clawbar.
+#
+# Reads the current voice-bridge phase from $CLAWBAR_STATE_FILE (default
+# $XDG_RUNTIME_DIR/clawbar.state, written by claw-talk) and prints a single
+# line of waybar JSON: {"text","alt","class","tooltip"}.
+#
+#   class = the raw state name (idle|listening|transcribing|looking|
+#           thinking|speaking|error) so style.css can theme each phase.
+#
+# Robust: if the file is missing/unreadable it falls back to "idle".
+# Configure via clawbar.env (CLAWBAR_STATE_FILE) if you moved the state file.
+# ===========================================================================
+set -uo pipefail
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# load config (state file location may be overridden there); no secrets
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+for _cfg in \
+  "${CLAWBAR_ENV:-}" \
+  "$SELF_DIR/clawbar.env" \
+  "$HOME/.config/clawbar/clawbar.env" \
+  "/datos/claw-voice/clawbar.env" ; do
+  [ -n "${_cfg:-}" ] && [ -f "$_cfg" ] && { . "$_cfg"; break; }
+done
+
+STATE_FILE="${CLAWBAR_STATE_FILE:-$XDG_RUNTIME_DIR/clawbar.state}"
+
+state="idle"
+if [ -r "$STATE_FILE" ]; then
+  state="$(tr -d '[:space:]' < "$STATE_FILE" 2>/dev/null)"
+fi
+case "$state" in
+  idle|listening|transcribing|looking|thinking|speaking|error) : ;;
+  *) state="idle" ;;
+esac
+
+case "$state" in
+  idle)         icon="🐾"; label="Claw inactivo" ;;
+  listening)    icon="🎙"; label="Escuchando…" ;;
+  transcribing) icon="📝"; label="Transcribiendo…" ;;
+  looking)      icon="👁"; label="Mirando la pantalla…" ;;
+  thinking)     icon="🤔"; label="Pensando…" ;;
+  speaking)     icon="🗣"; label="Hablando…" ;;
+  error)        icon="⚠"; label="Error (ver notificación)" ;;
+esac
+
+help="click: hablar · click-der: dashboard · click-medio: terminal"
+tooltip="Claw — $label\n$help"
+
+# emit JSON (jq if available for safe escaping; otherwise hand-rolled)
+if command -v jq >/dev/null 2>&1; then
+  jq -nc --arg t "$icon" --arg a "$state" --arg c "$state" --arg tt "$tooltip" \
+     '{text:$t, alt:$a, class:$c, tooltip:$tt}'
+else
+  # minimal escaping fallback (icons are emoji, label has no quotes)
+  tt_esc="${tooltip//\"/\\\"}"
+  printf '{"text":"%s","alt":"%s","class":"%s","tooltip":"%s"}\n' \
+    "$icon" "$state" "$state" "$tt_esc"
+fi

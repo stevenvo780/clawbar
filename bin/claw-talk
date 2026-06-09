@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# claw-talk — Voice bridge (push-to-talk / VAD) between your desktop and an
+#             OpenClaw agent running in a Docker container.
+#
+# clawbar edition: adds Voice Activity Detection (auto-stop on silence) and
+# waybar state emission on top of the original push-to-talk toggle. The manual
+# toggle keeps working as a fallback / override.
+#
+# Flow:
+#   1st press (or `start`):  start recording the mic (pw-record). If CLAWBAR_VAD
+#                            is on, a background watcher auto-stops after a short
+#                            silence once you have actually spoken.
+#   2nd press (or `stop`):   stop, transcribe (Whisper STT via a sidecar audio
+#                            container), optionally capture the screen, send to
+#                            the agent (`docker exec <ctr> openclaw agent`),
+#                            synthesize the reply (Kokoro TTS) and play it back.
+#
+# Runs as your desktop user inside the graphical (Wayland/X11) session. It does
+# NOT modify the agent container: it uses `docker exec` for the agent and plain
+# HTTP to the audio sidecar. The agent stays isolated.
+#
+# Config: copy clawbar.env.example -> clawbar.env (next to this script, or at
+#         $CLAWBAR_ENV / ~/.config/clawbar/clawbar.env). NO secrets required.
+# ===========================================================================
+set -uo pipefail
+
+# --- session environment (robust when invoked outside the graphical session) ---
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+export DISPLAY="${DISPLAY:-:0}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+
+# --- config: load clawbar.env from the first location that exists -------------
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+for _cfg in \
+  "${CLAWBAR_ENV:-}" \
+  "$SELF_DIR/clawbar.env" \
+  "$HOME/.config/clawbar/clawbar.env" \
+  "/datos/claw-voice/clawbar.env" \
+  "$SELF_DIR/claw-voice.env" \
+  "/datos/claw-voice/claw-voice.env" ; do
+  [ -n "${_cfg:-}" ] && [ -f "$_cfg" ] && { . "$_cfg"; break; }
+done
+
+# --- agent / audio containers -------------------------------------------------
+CLAW_CTR="${CLAW_CTR:-claw}"
+AUDIO_CTR="${AUDIO_CTR:-claw-audio}"
+AUDIO_PORT="${AUDIO_PORT:-8000}"
+TTS_MODEL="${TTS_MODEL:-speaches-ai/Kokoro-82M-v1.0-ONNX-fp16}"
+STT_MODEL="${STT_MODEL:-deepdml/faster-whisper-large-v3-turbo-ct2}"
+VOICE="${VOICE:-ef_dora}"
+LANG_STT="${LANG_STT:-es}"
+AGENT="${AGENT:-main}"
+SESSION="${SESSION:-desktop-voice}"
+THINKING="${THINKING:-off}"          # off = conversational/fast; medium/high = more reasoning
+AGENT_TIMEOUT="${AGENT_TIMEOUT:-180}"
+MIC_TARGET="${MIC_TARGET:-}"         # empty = default PipeWire source
+MAX_REC_SECS="${MAX_REC_SECS:-60}"   # hard recording cap
+SPEAK_MAXCHARS="${SPEAK_MAXCHARS:-1400}"
+SHOT_MODE="${SHOT_MODE:--m}"         # -m current monitor | -f whole desktop | -a active window
+SHOT_MAXPX="${SHOT_MAXPX:-1568}"     # downscale long edge (vision sweet spot)
+SHOT_HOSTDIR="${SHOT_HOSTDIR:-/datos/claw-config/clawd/_voice}"
+SHOT_AGENTREL="${SHOT_AGENTREL:-_voice/screen.png}"
+SCREEN_REGEX="${SCREEN_REGEX:-mir[aá]|fij[aá]te|qu[eé] ves|qu[eé] hay|pantalla|monitor|esto que (ves|tengo|hay)|la captura|ac[aá] (en pantalla|arriba)|le[eé] (esto|la pantalla)|look at|what.?s on (the |my )?screen}"
+STT_PROMPT="${STT_PROMPT:-Claw, desktop, agent, screen, dashboard, terminal.}"
+
+# --- VAD (Voice Activity Detection) -------------------------------------------
+CLAWBAR_VAD="${CLAWBAR_VAD:-on}"        # on|off — auto-stop on silence
+VAD_SILENCE_MS="${VAD_SILENCE_MS:-1500}" # silence needed to auto-stop (after speech)
+VAD_THRESH_DB="${VAD_THRESH_DB:--38}"   # RMS dBFS above which a frame counts as speech
+VAD_MIN_SPEECH_MS="${VAD_MIN_SPEECH_MS:-300}" # min cumulative speech before arming silence cutoff
+VAD_START_GRACE_MS="${VAD_START_GRACE_MS:-8000}" # max wait for speech to begin before giving up
+
+# --- waybar state emission ----------------------------------------------------
+CLAWBAR_WAYBAR_SIGNAL="${CLAWBAR_WAYBAR_SIGNAL:-8}"  # waybar custom signal (RTMIN+N)
+STATE_FILE="${CLAWBAR_STATE_FILE:-$XDG_RUNTIME_DIR/clawbar.state}"
+
+# --- runtime state files ------------------------------------------------------
+STATE="$XDG_RUNTIME_DIR/claw-talk"
+REC_PID_F="$STATE.recpid"
+REC_WAV_F="$STATE.rec.wav"
+BUSY_D="$STATE.busy.d"
+VAD_PID_F="$STATE.vadpid"
+
+# ===========================================================================
+# helpers
+# ===========================================================================
+set_state() {  # $1 = idle|listening|transcribing|looking|thinking|speaking|error
+  local s="${1:-idle}"
+  printf '%s\n' "$s" > "$STATE_FILE" 2>/dev/null || true
+  pkill "-RTMIN+${CLAWBAR_WAYBAR_SIGNAL}" waybar 2>/dev/null || true
+}
+
+AUDIO_BASE=""
+resolve_audio() {   # stable endpoint without publishing a port: container IP on its docker net
+  local ip
+  ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$AUDIO_CTR" 2>/dev/null | awk '{print $1}')"
+  [ -n "$ip" ] && AUDIO_BASE="http://$ip:$AUDIO_PORT/v1"
+}
+
+notify() {  # $1 body (fixed title). Non-critical.
+  command -v notify-send >/dev/null 2>&1 && notify-send -a "Claw" -t 5000 -i audio-input-microphone "Claw 🐾" "$1" 2>/dev/null || true
+}
+cue() { command -v canberra-gtk-play >/dev/null 2>&1 && canberra-gtk-play -i "$1" >/dev/null 2>&1 & }
+
+# ===========================================================================
+# VAD watcher — reads the mic and auto-stops on trailing silence
+# ===========================================================================
+# A self-contained python3 RMS-based detector. It opens its OWN mic stream
+# (ffmpeg -f pulse) in parallel with pw-record, computes RMS dBFS per ~30ms
+# frame, waits for speech to begin, and exits 0 once it sees VAD_SILENCE_MS of
+# continuous silence AFTER at least VAD_MIN_SPEECH_MS of speech. Exit 0 -> the
+# watcher triggers stop_and_process. Any non-zero exit (timeout / no speech /
+# killed) is treated as "let the manual toggle / hard cap handle it".
+vad_watch() {
+  [ "$CLAWBAR_VAD" = "on" ] || return 0
+  command -v ffmpeg  >/dev/null 2>&1 || { return 0; }
+  command -v python3 >/dev/null 2>&1 || { return 0; }
+
+  local pulse_src="${MIC_TARGET:-default}"
+  (
+    ffmpeg -hide_banner -loglevel quiet -f pulse -i "$pulse_src" \
+           -ar 16000 -ac 1 -f s16le - 2>/dev/null \
+    | CLAWBAR_VAD_SILENCE_MS="$VAD_SILENCE_MS" \
+      CLAWBAR_VAD_THRESH_DB="$VAD_THRESH_DB" \
+      CLAWBAR_VAD_MIN_SPEECH_MS="$VAD_MIN_SPEECH_MS" \
+      CLAWBAR_VAD_START_GRACE_MS="$VAD_START_GRACE_MS" \
+      python3 "$SELF_DIR/clawbar-vad.py"
+  ) &
+  local vpid=$!
+  echo "$vpid" > "$VAD_PID_F"
+
+  # Block until python decides (exit 0 = silence detected) or it is killed.
+  if wait "$vpid" 2>/dev/null; then
+    rm -f "$VAD_PID_F"
+    # Only trigger if we are still recording (the manual toggle may have won).
+    if [ -f "$REC_PID_F" ]; then
+      stop_and_process
+    fi
+  else
+    rm -f "$VAD_PID_F"
+  fi
+}
+
+stop_vad() {
+  local vp; vp="$(cat "$VAD_PID_F" 2>/dev/null)"; rm -f "$VAD_PID_F"
+  [ -n "$vp" ] && kill "$vp" 2>/dev/null
+  # also reap the ffmpeg children of the watcher subshell
+  [ -n "$vp" ] && pkill -P "$vp" 2>/dev/null || true
+}
+
+# ===========================================================================
+# recording
+# ===========================================================================
+start_rec() {
+  rm -f "$REC_WAV_F"
+  nohup pw-record ${MIC_TARGET:+--target "$MIC_TARGET"} --rate 16000 --channels 1 "$REC_WAV_F" >/dev/null 2>&1 &
+  echo $! > "$REC_PID_F"
+  set_state listening
+  cue message-new-instant
+  if [ "$CLAWBAR_VAD" = "on" ]; then
+    notify "🎙 Escuchando… (VAD: corto solo tras el silencio · atajo = enviar ya)"
+  else
+    notify "🎙 Escuchando… (apreta el atajo otra vez para enviar)"
+  fi
+  # hard safety cap: cut if you forget
+  ( sleep "$MAX_REC_SECS"; [ -f "$REC_PID_F" ] && kill -INT "$(cat "$REC_PID_F" 2>/dev/null)" 2>/dev/null ) >/dev/null 2>&1 &
+  # VAD watcher (background; calls stop_and_process itself on trailing silence)
+  if [ "$CLAWBAR_VAD" = "on" ]; then
+    ( vad_watch ) >/dev/null 2>&1 &
+  fi
+}
+
+stop_and_process() {
+  # single-shot guard: whoever grabs the busy dir first owns this turn
+  mkdir "$BUSY_D" 2>/dev/null || { notify "Estoy con el turno anterior, espera…"; return; }
+  trap 'rmdir "$BUSY_D" 2>/dev/null; set_state idle' RETURN
+  stop_vad
+  local pid; pid="$(cat "$REC_PID_F" 2>/dev/null)"; rm -f "$REC_PID_F"
+  [ -n "$pid" ] && kill -INT "$pid" 2>/dev/null
+  sleep 0.4
+  [ -s "$REC_WAV_F" ] || { notify "No grabe nada (microfono?)"; set_state error; sleep 1; return; }
+  process_turn
+}
+
+# ===========================================================================
+# screen capture
+# ===========================================================================
+capture_screen() {  # $1 = png destination. Returns 0 if something was captured.
+  local out="$1" raw; raw="$(mktemp --suffix=.png)"; rm -f "$out"
+  timeout 15 spectacle -b -n "$SHOT_MODE" -o "$raw" >/dev/null 2>&1
+  [ -s "$raw" ] || timeout 15 spectacle -b -n -f -o "$raw" >/dev/null 2>&1
+  [ -s "$raw" ] || timeout 15 grim "$raw" >/dev/null 2>&1
+  [ -s "$raw" ] || { rm -f "$raw"; return 1; }
+  mkdir -p "$(dirname "$out")"
+  if command -v magick >/dev/null 2>&1; then
+    magick "$raw" -resize "${SHOT_MAXPX}x${SHOT_MAXPX}>" "$out" 2>/dev/null
+  elif command -v convert >/dev/null 2>&1; then
+    convert "$raw" -resize "${SHOT_MAXPX}x${SHOT_MAXPX}>" "$out" 2>/dev/null
+  fi
+  [ -s "$out" ] || cp -f "$raw" "$out"
+  rm -f "$raw"
+  [ -s "$out" ]
+}
+
+# ===========================================================================
+# the turn: transcribe -> (look) -> think -> speak
+# ===========================================================================
+process_turn() {
+  resolve_audio
+  [ -n "$AUDIO_BASE" ] || { notify "No encuentro $AUDIO_CTR (sidecar caido?)"; set_state error; sleep 1; return; }
+
+  set_state transcribing
+  notify "📝 Transcribiendo…"
+  local txt
+  txt="$(curl -s -m 60 -X POST "$AUDIO_BASE/audio/transcriptions" \
+          -F "file=@$REC_WAV_F;type=audio/wav" -F "model=$STT_MODEL" \
+          -F "language=$LANG_STT" -F "response_format=json" -F "prompt=$STT_PROMPT" \
+        | jq -r '.text // empty' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ -n "$txt" ] || { notify "No te entendi, proba de nuevo."; cue dialog-error; set_state error; sleep 1; return; }
+  notify "🗣 Vos: $txt"
+
+  local msg="$txt"
+  if printf '%s' "$txt" | grep -qiE "$SCREEN_REGEX"; then
+    set_state looking
+    notify "👁 Mirando la pantalla…"
+    if capture_screen "$SHOT_HOSTDIR/screen.png"; then
+      msg="[El usuario te habla por voz desde el escritorio. Adjunto una captura de su pantalla en \"$SHOT_AGENTREL\" (dentro de tu workspace). Abrila como IMAGEN con tu herramienta Read y respondé segun lo que veas. Consulta del usuario:]
+
+$txt"
+    fi
+  fi
+
+  set_state thinking
+  notify "🤔 Pensando…"
+  local reply
+  reply="$(docker exec "$CLAW_CTR" openclaw agent --agent "$AGENT" \
+            --session-id "$SESSION" --thinking "$THINKING" --timeout "$AGENT_TIMEOUT" \
+            -m "$msg" --json 2>/dev/null \
+          | jq -r '.result.payloads[]?.text // empty' | sed '/^[[:space:]]*$/d')"
+  [ -n "$reply" ] || { notify "El agente no devolvio texto."; cue dialog-error; set_state error; sleep 1; return; }
+  notify "💬 Claw: $(printf '%s' "$reply" | head -c 240)"
+
+  # speak (Kokoro -> wav -> default sink)
+  set_state speaking
+  local say wav; say="$(printf '%s' "$reply" | head -c "$SPEAK_MAXCHARS")"
+  wav="$(mktemp --suffix=.wav)"
+  curl -s -m 120 -X POST "$AUDIO_BASE/audio/speech" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg m "$TTS_MODEL" --arg v "$VOICE" --arg i "$say" \
+          '{model:$m,voice:$v,input:$i,response_format:"wav"}')" -o "$wav"
+  if [ -s "$wav" ]; then paplay "$wav" 2>/dev/null || pw-play "$wav" 2>/dev/null; fi
+  rm -f "$wav"
+  # RETURN trap restores idle state
+}
+
+# ===========================================================================
+# main
+# ===========================================================================
+case "${1:-toggle}" in
+  toggle) if [ -f "$REC_PID_F" ]; then stop_and_process; else start_rec; fi ;;
+  start)  start_rec ;;
+  stop)   stop_and_process ;;
+  state)  cat "$STATE_FILE" 2>/dev/null || echo idle ;;
+  say)    resolve_audio; w="$(mktemp --suffix=.wav)"
+          curl -s -X POST "$AUDIO_BASE/audio/speech" -H 'Content-Type: application/json' \
+            -d "$(jq -nc --arg m "$TTS_MODEL" --arg v "$VOICE" --arg i "${2:-hola}" '{model:$m,voice:$v,input:$i,response_format:"wav"}')" -o "$w"
+          paplay "$w" 2>/dev/null || pw-play "$w"; rm -f "$w" ;;
+  test)   resolve_audio; echo "audio=$AUDIO_BASE"
+          echo "vad=$CLAWBAR_VAD silence_ms=$VAD_SILENCE_MS thresh_db=$VAD_THRESH_DB"
+          echo "state_file=$STATE_FILE signal=RTMIN+$CLAWBAR_WAYBAR_SIGNAL"
+          echo -n "claw exec: "; docker exec "$CLAW_CTR" echo ok 2>&1
+          echo -n "vad helper: "; [ -f "$SELF_DIR/clawbar-vad.py" ] && echo "present" || echo "MISSING ($SELF_DIR/clawbar-vad.py)"
+          echo -n "captura: "; capture_screen /tmp/claw-talk-test.png && echo "ok $(file -b /tmp/claw-talk-test.png 2>/dev/null)" || echo FALLO ;;
+  *) echo "uso: claw-talk [toggle|start|stop|say <txt>|state|test]" >&2; exit 2 ;;
+esac
