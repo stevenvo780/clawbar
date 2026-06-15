@@ -135,8 +135,17 @@ fi
 # 4) style.css append
 # ---------------------------------------------------------------------------
 if [ -f "$WAYBAR_STYLE" ]; then
-  if grep -q 'custom-claw' "$WAYBAR_STYLE"; then
-    ok "style already contains clawbar rules, skipped"
+  if grep -q 'custom-claw.muted' "$WAYBAR_STYLE"; then
+    ok "style already has clawbar privacy rules, skipped"
+  elif grep -q 'custom-claw' "$WAYBAR_STYLE"; then
+    # instalación previa: agregamos SOLO las clases nuevas de privacidad
+    backup "$WAYBAR_STYLE"
+    {
+      printf '\n/* === clawbar privacidad (added %s) === */\n' "$TS"
+      printf '#custom-claw.muted { color: #f38ba8; }\n'
+      printf '#custom-claw.blind { color: #f9e2af; }\n'
+    } >> "$WAYBAR_STYLE"
+    ok "appended clawbar privacy styles to $WAYBAR_STYLE"
   else
     backup "$WAYBAR_STYLE"
     {
@@ -153,8 +162,19 @@ fi
 # 5) Hyprland keybind (only if absent)
 # ---------------------------------------------------------------------------
 if [ -f "$HYPR_CONF" ]; then
-  if grep -qE 'claw-talk' "$HYPR_CONF"; then
-    ok "hyprland already binds claw-talk, not duplicating"
+  if grep -qE 'claw-talk (mute|eyes|privacy)' "$HYPR_CONF"; then
+    ok "hyprland already has clawbar privacy binds, not duplicating"
+  elif grep -qE 'claw-talk' "$HYPR_CONF"; then
+    # instalación previa (solo el bind de voz): agregamos SOLO lo nuevo
+    backup "$HYPR_CONF"
+    {
+      printf '\n# === clawbar privacidad/autostart (added %s) ===\n' "$TS"
+      printf 'bind = $mainMod SHIFT, M, exec, claw-talk mute      # Claw: mutear / desmutear\n'
+      printf 'bind = $mainMod SHIFT, O, exec, claw-talk eyes      # Claw: tapar / abrir ojos\n'
+      printf 'bind = $mainMod SHIFT, P, exec, claw-talk privacy   # Claw: privacidad total\n'
+      printf 'exec-once = claw-up\n'
+    } >> "$HYPR_CONF"
+    ok "added clawbar privacy binds + autostart to $HYPR_CONF"
   else
     backup "$HYPR_CONF"
     {
