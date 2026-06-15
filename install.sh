@@ -69,7 +69,7 @@ echo "=== clawbar install ($TS) ==="
 mkdir -p "$BIN_DIR"
 
 # 1) bin/*
-for f in claw-talk clawbar-vad.py clawbar-status; do
+for f in claw-talk clawbar-vad.py clawbar-status claw-up; do
   if [ -f "$BIN_DIR/$f" ]; then backup "$BIN_DIR/$f"; fi
   install -m 0755 "$SRC_DIR/bin/$f" "$BIN_DIR/$f"
   ok "installed $BIN_DIR/$f"
