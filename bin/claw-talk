@@ -82,6 +82,10 @@ REC_PID_F="$STATE.recpid"
 REC_WAV_F="$STATE.rec.wav"
 BUSY_D="$STATE.busy.d"
 VAD_PID_F="$STATE.vadpid"
+# --- privacidad: mic mute / ojos (vision). Flag PRESENTE = activado.
+# Los lee tambien clawbar-status para el icono (🔇 / 🙈).
+MUTED_F="${CLAWBAR_MUTED_FILE:-$XDG_RUNTIME_DIR/clawbar.muted}"
+EYES_OFF_F="${CLAWBAR_EYES_FILE:-$XDG_RUNTIME_DIR/clawbar.eyes-off}"
 
 # ===========================================================================
 # helpers
@@ -154,6 +158,11 @@ stop_vad() {
 # recording
 # ===========================================================================
 start_rec() {
+  if [ -f "$MUTED_F" ]; then
+    notify "🔇 Muteado — quita el mute para hablar (claw-talk mute off)"
+    cue dialog-error
+    return
+  fi
   rm -f "$REC_WAV_F"
   nohup pw-record ${MIC_TARGET:+--target "$MIC_TARGET"} --rate 16000 --channels 1 "$REC_WAV_F" >/dev/null 2>&1 &
   echo $! > "$REC_PID_F"
@@ -222,7 +231,7 @@ process_turn() {
   notify "🗣 Vos: $txt"
 
   local msg="$txt"
-  if printf '%s' "$txt" | grep -qiE "$SCREEN_REGEX"; then
+  if [ ! -f "$EYES_OFF_F" ] && printf '%s' "$txt" | grep -qiE "$SCREEN_REGEX"; then
     set_state looking
     notify "👁 Mirando la pantalla…"
     if capture_screen "$SHOT_HOSTDIR/screen.png"; then
@@ -262,6 +271,20 @@ case "${1:-toggle}" in
   start)  start_rec ;;
   stop)   stop_and_process ;;
   state)  cat "$STATE_FILE" 2>/dev/null || echo idle ;;
+  mute)   case "${2:-toggle}" in
+            on) : > "$MUTED_F" ;; off) rm -f "$MUTED_F" ;;
+            *) if [ -f "$MUTED_F" ]; then rm -f "$MUTED_F"; else : > "$MUTED_F"; fi ;;
+          esac
+          [ -f "$MUTED_F" ] && notify "🔇 Mic muteado" || notify "🎙 Mic activo"
+          pkill "-RTMIN+${CLAWBAR_WAYBAR_SIGNAL}" waybar 2>/dev/null || true ;;
+  eyes)   case "${2:-toggle}" in
+            off) : > "$EYES_OFF_F" ;; on) rm -f "$EYES_OFF_F" ;;
+            *) if [ -f "$EYES_OFF_F" ]; then rm -f "$EYES_OFF_F"; else : > "$EYES_OFF_F"; fi ;;
+          esac
+          [ -f "$EYES_OFF_F" ] && notify "🙈 Ojos tapados" || notify "👁 Ojos abiertos"
+          pkill "-RTMIN+${CLAWBAR_WAYBAR_SIGNAL}" waybar 2>/dev/null || true ;;
+  privacy) : > "$MUTED_F"; : > "$EYES_OFF_F"; notify "🕶 Privacidad: mic + ojos OFF"
+          pkill "-RTMIN+${CLAWBAR_WAYBAR_SIGNAL}" waybar 2>/dev/null || true ;;
   say)    resolve_audio; w="$(mktemp --suffix=.wav)"
           curl -s -X POST "$AUDIO_BASE/audio/speech" -H 'Content-Type: application/json' \
             -d "$(jq -nc --arg m "$TTS_MODEL" --arg v "$VOICE" --arg i "${2:-hola}" '{model:$m,voice:$v,input:$i,response_format:"wav"}')" -o "$w"
@@ -272,5 +295,5 @@ case "${1:-toggle}" in
           echo -n "claw exec: "; docker exec "$CLAW_CTR" echo ok 2>&1
           echo -n "vad helper: "; [ -f "$SELF_DIR/clawbar-vad.py" ] && echo "present" || echo "MISSING ($SELF_DIR/clawbar-vad.py)"
           echo -n "captura: "; capture_screen /tmp/claw-talk-test.png && echo "ok $(file -b /tmp/claw-talk-test.png 2>/dev/null)" || echo FALLO ;;
-  *) echo "uso: claw-talk [toggle|start|stop|say <txt>|state|test]" >&2; exit 2 ;;
+  *) echo "uso: claw-talk [toggle|start|stop|say <txt>|state|mute [on|off]|eyes [on|off]|privacy|test]" >&2; exit 2 ;;
 esac

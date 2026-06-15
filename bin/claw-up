@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# claw-up — "dejarlo iniciado": asegura que el stack de Claw esté arriba.
+#
+# Pensado para un `exec-once = claw-up` en hyprland.conf (autostart al login).
+# Best-effort e IDEMPOTENTE. Fiel a la filosofía delgada de clawbar: NO crea ni
+# modifica contenedores — solo ARRANCA los que ya existen si están detenidos.
+# Si no hay docker o los contenedores no existen, sale 0 en silencio.
+#
+# (Escucha-continua/manos-libres NO se activa acá: eso es un modo aparte, opt-in,
+#  porque va en contra del control de privacidad mute/ojos. Sigue siendo push-to-
+#  talk / VAD por toggle. Ver README.)
+# ===========================================================================
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+for _cfg in \
+  "${CLAWBAR_ENV:-}" \
+  "$SELF_DIR/clawbar.env" \
+  "$HOME/.config/clawbar/clawbar.env" \
+  "/datos/claw-voice/clawbar.env" ; do
+  [ -n "${_cfg:-}" ] && [ -f "$_cfg" ] && { . "$_cfg"; break; }
+done
+
+CLAW_CTR="${CLAW_CTR:-claw}"
+AUDIO_CTR="${AUDIO_CTR:-claw-audio}"
+
+command -v docker >/dev/null 2>&1 || exit 0
+
+started=""
+for c in "$CLAW_CTR" "$AUDIO_CTR"; do
+  running="$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" || continue  # no existe -> saltar
+  [ "$running" = "true" ] && continue                                               # ya corriendo
+  docker start "$c" >/dev/null 2>&1 && started="$started $c"
+done
+
+if [ -n "$started" ] && command -v notify-send >/dev/null 2>&1; then
+  notify-send -a "Claw" -t 4000 "Claw 🐾" "Stack iniciado:$started"
+fi
+exit 0

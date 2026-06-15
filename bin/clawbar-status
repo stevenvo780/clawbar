@@ -47,16 +47,23 @@ case "$state" in
   error)        icon="⚠"; label="Error (ver notificación)" ;;
 esac
 
+# privacidad: mic mute / ojos (vision) — overlay sobre el icono de fase
+MUTED_F="${CLAWBAR_MUTED_FILE:-$XDG_RUNTIME_DIR/clawbar.muted}"
+EYES_F="${CLAWBAR_EYES_FILE:-$XDG_RUNTIME_DIR/clawbar.eyes-off}"
+klass="$state"
+if [ -f "$MUTED_F" ]; then icon="🔇"; label="Muteado (mic off)"; klass="muted"; fi
+if [ -f "$EYES_F" ]; then icon="${icon}🙈"; label="$label · ojos tapados"; klass="${klass} blind"; fi
+
 help="click: hablar · click-der: dashboard · click-medio: terminal"
 tooltip="Claw — $label\n$help"
 
 # emit JSON (jq if available for safe escaping; otherwise hand-rolled)
 if command -v jq >/dev/null 2>&1; then
-  jq -nc --arg t "$icon" --arg a "$state" --arg c "$state" --arg tt "$tooltip" \
+  jq -nc --arg t "$icon" --arg a "$state" --arg c "$klass" --arg tt "$tooltip" \
      '{text:$t, alt:$a, class:$c, tooltip:$tt}'
 else
   # minimal escaping fallback (icons are emoji, label has no quotes)
   tt_esc="${tooltip//\"/\\\"}"
   printf '{"text":"%s","alt":"%s","class":"%s","tooltip":"%s"}\n' \
-    "$icon" "$state" "$state" "$tt_esc"
+    "$icon" "$state" "$klass" "$tt_esc"
 fi

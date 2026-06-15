@@ -52,6 +52,16 @@
     animation: clawbar-blink 0.6s step-start infinite;
 }
 
+/* privacidad: muteado (mic off) — rojo fijo */
+#custom-claw.muted {
+    color: #f38ba8;
+}
+
+/* privacidad: ojos tapados (sin screen-vision) — amarillo */
+#custom-claw.blind {
+    color: #f9e2af;
+}
+
 @keyframes clawbar-pulse {
     0%   { opacity: 1.0; }
     50%  { opacity: 0.45; }
