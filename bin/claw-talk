@@ -82,6 +82,8 @@ REC_PID_F="$STATE.recpid"
 REC_WAV_F="$STATE.rec.wav"
 BUSY_D="$STATE.busy.d"
 VAD_PID_F="$STATE.vadpid"
+TURN_F="$STATE.turn"
+CONTROL_LOCK_F="$STATE.control.lock"
 # --- privacidad: mic mute / ojos (vision). Flag PRESENTE = activado.
 # Los lee tambien clawbar-status para el icono (🔇 / 🙈).
 MUTED_F="${CLAWBAR_MUTED_FILE:-$XDG_RUNTIME_DIR/clawbar.muted}"
@@ -99,7 +101,11 @@ set_state() {  # $1 = idle|listening|transcribing|looking|thinking|speaking|erro
 AUDIO_BASE=""
 resolve_audio() {   # stable endpoint without publishing a port: container IP on its docker net
   local ip
-  ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$AUDIO_CTR" 2>/dev/null | awk '{print $1}')"
+  ip="$(if [ -n "${1:-}" ]; then
+          run_for_turn "$1" docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$AUDIO_CTR" 2>/dev/null
+        else
+          docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$AUDIO_CTR" 2>/dev/null
+        fi | awk '{print $1}')"
   [ -n "$ip" ] && AUDIO_BASE="http://$ip:$AUDIO_PORT/v1"
 }
 
@@ -107,6 +113,95 @@ notify() {  # $1 body (fixed title). Non-critical.
   command -v notify-send >/dev/null 2>&1 && notify-send -a "Claw" -t 5000 -i audio-input-microphone "Claw 🐾" "$1" 2>/dev/null || true
 }
 cue() { command -v canberra-gtk-play >/dev/null 2>&1 && canberra-gtk-play -i "$1" >/dev/null 2>&1 & }
+
+# Only hold this lock while changing state or launching a child, never while
+# waiting for audio, STT or the agent. Every invocation opens its own lock FD.
+control_lock() {
+  exec 9>"$CONTROL_LOCK_F" || exit 1
+  flock 9 || { echo "claw-talk: cannot lock recording state (flock required)" >&2; exit 1; }
+}
+control_unlock() { flock -u 9; }
+turn_valid() {
+  [ ! -f "$MUTED_F" ] && [ -d "$1" ] && [ ! -f "$1/cancelled" ] &&
+    [ "$(cat "$TURN_F" 2>/dev/null)" = "$1" ]
+}
+process_stamp() {  # Linux start time distinguishes a child from a reused PID.
+  local stat fields
+  IFS= read -r stat 2>/dev/null < "/proc/$1/stat" || return 1
+  stat="${stat##*) }"
+  read -ra fields <<< "$stat"
+  printf '%s\n' "${fields[19]:-}"
+}
+record_worker() { printf '%s %s\n' "$2" "$(process_stamp "$2")" > "$1"; }
+retire_worker() {
+  local turn="$1" kind="$2" pid="$3" saved stamp
+  control_lock
+  read -r saved stamp 2>/dev/null < "$turn/${kind}pid" || saved=""
+  if [ "$saved" = "$pid" ]; then
+    rm -f "$turn/${kind}pid"
+    if [ "$kind" = vad ] && [ "$(cat "$TURN_F" 2>/dev/null)" = "$turn" ]; then
+      rm -f "$VAD_PID_F"
+    fi
+  fi
+  control_unlock
+}
+stop_worker() {
+  local pid="" stamp=""
+  read -r pid stamp 2>/dev/null < "$1" || true
+  rm -f "$1"
+  [ -n "$pid" ] && [ "$pid" != "$BASHPID" ] || return 0
+  [ -n "$stamp" ] && [ "$(process_stamp "$pid")" = "$stamp" ] || return 0
+  # Stop children before the supervisor so the VAD stream cannot be orphaned.
+  pkill -TERM -P "$pid" 2>/dev/null || true
+  kill -TERM "$pid" 2>/dev/null || true
+}
+cancel_turn() {  # caller holds the control lock
+  local turn; turn="$(cat "$TURN_F" 2>/dev/null)"
+  if [ -n "$turn" ] && [ -d "$turn" ]; then
+    : > "$turn/cancelled"
+    stop_worker "$turn/cappid"
+    stop_worker "$turn/vadpid"
+    stop_worker "$turn/iopid"
+    stop_worker "$turn/recpid"
+    rm -rf -- "$turn"
+  fi
+  rm -f "$TURN_F" "$REC_PID_F" "$REC_WAV_F" "$VAD_PID_F"
+  set_state idle
+}
+finish_turn() {
+  local turn="$1"
+  control_lock
+  if [ "$(cat "$TURN_F" 2>/dev/null)" = "$turn" ]; then
+    rm -f "$TURN_F" "$REC_PID_F" "$REC_WAV_F" "$VAD_PID_F"
+    set_state idle
+  fi
+  rm -rf -- "$turn"
+  rmdir "$BUSY_D" 2>/dev/null || true
+  control_unlock
+}
+set_turn_state() (
+  control_lock
+  turn_valid "$1" || { control_unlock; return 1; }
+  set_state "$2"
+  control_unlock
+)
+run_for_turn() (
+  local turn="$1" pid result; shift
+  control_lock
+  turn_valid "$turn" || { control_unlock; return 1; }
+  ( exec 9>&-
+    if declare -F "$1" >/dev/null; then "$@"; else exec "$@"; fi
+  ) &
+  pid=$!
+  record_worker "$turn/iopid" "$pid"
+  control_unlock
+  trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; exit 1' TERM INT
+  wait "$pid"; result=$?
+  control_lock
+  rm -f "$turn/iopid"
+  control_unlock
+  return "$result"
+)
 
 # ===========================================================================
 # VAD watcher — reads the mic and auto-stops on trailing silence
@@ -118,54 +213,68 @@ cue() { command -v canberra-gtk-play >/dev/null 2>&1 && canberra-gtk-play -i "$1
 # watcher triggers stop_and_process. Any non-zero exit (timeout / no speech /
 # killed) is treated as "let the manual toggle / hard cap handle it".
 vad_watch() {
+  local turn="$1" ffpid="" pypid="" result=1 pulse_src="${MIC_TARGET:-default}"
+  # Retire the supervisor even on no speech, EOF, missing dependencies or TERM.
+  trap 'flock -u 9 2>/dev/null || true; kill -TERM ${ffpid:+"$ffpid"} ${pypid:+"$pypid"} 2>/dev/null; wait ${ffpid:+"$ffpid"} ${pypid:+"$pypid"} 2>/dev/null; rm -f "$turn/vad.pcm"; retire_worker "$turn" vad "$BASHPID"' EXIT
+  trap 'exit 1' TERM INT
   [ "$CLAWBAR_VAD" = "on" ] || return 0
   command -v ffmpeg  >/dev/null 2>&1 || { return 0; }
   command -v python3 >/dev/null 2>&1 || { return 0; }
 
-  local pulse_src="${MIC_TARGET:-default}"
-  (
-    ffmpeg -hide_banner -loglevel quiet -f pulse -i "$pulse_src" \
-           -ar 16000 -ac 1 -f s16le - 2>/dev/null \
-    | CLAWBAR_VAD_SILENCE_MS="$VAD_SILENCE_MS" \
+  # Explicit child PIDs let cancellation close both microphone readers.
+  control_lock
+  turn_valid "$turn" || { control_unlock; return 1; }
+  mkfifo "$turn/vad.pcm" || { control_unlock; return 1; }
+  ffmpeg -hide_banner -loglevel quiet -f pulse -i "$pulse_src" \
+           -ar 16000 -ac 1 -f s16le - > "$turn/vad.pcm" 2>/dev/null &
+  ffpid=$!
+  CLAWBAR_VAD_SILENCE_MS="$VAD_SILENCE_MS" \
       CLAWBAR_VAD_THRESH_DB="$VAD_THRESH_DB" \
       CLAWBAR_VAD_MIN_SPEECH_MS="$VAD_MIN_SPEECH_MS" \
       CLAWBAR_VAD_START_GRACE_MS="$VAD_START_GRACE_MS" \
-      python3 "$SELF_DIR/clawbar-vad.py"
-  ) &
-  local vpid=$!
-  echo "$vpid" > "$VAD_PID_F"
+      python3 "$SELF_DIR/clawbar-vad.py" < "$turn/vad.pcm" &
+  pypid=$!
+  control_unlock
 
   # Block until python decides (exit 0 = silence detected) or it is killed.
-  if wait "$vpid" 2>/dev/null; then
-    rm -f "$VAD_PID_F"
-    # Only trigger if we are still recording (the manual toggle may have won).
-    if [ -f "$REC_PID_F" ]; then
-      stop_and_process
-    fi
-  else
-    rm -f "$VAD_PID_F"
+  wait "$pypid" 2>/dev/null && result=0
+  pypid=""
+  kill -TERM "$ffpid" 2>/dev/null || true
+  wait "$ffpid" 2>/dev/null || true
+  ffpid=""
+  if [ "$result" -eq 0 ]; then
+    # The supervisor has finished listening. Detach before its stop callback
+    # so stop_and_process will not terminate its own parent and processor.
+    retire_worker "$turn" vad "$BASHPID"
+    stop_and_process "$turn"
   fi
-}
-
-stop_vad() {
-  local vp; vp="$(cat "$VAD_PID_F" 2>/dev/null)"; rm -f "$VAD_PID_F"
-  [ -n "$vp" ] && kill "$vp" 2>/dev/null
-  # also reap the ffmpeg children of the watcher subshell
-  [ -n "$vp" ] && pkill -P "$vp" 2>/dev/null || true
 }
 
 # ===========================================================================
 # recording
 # ===========================================================================
-start_rec() {
+start_rec() (
+  control_lock
   if [ -f "$MUTED_F" ]; then
     notify "🔇 Muteado — quita el mute para hablar (claw-talk mute off)"
     cue dialog-error
+    control_unlock
     return
   fi
+  if [ -f "$TURN_F" ] || [ -d "$BUSY_D" ]; then
+    control_unlock
+    notify "Estoy con el turno anterior, espera…"
+    return
+  fi
+  local turn pid vpid
+  turn="$(mktemp -d "$STATE.turn.XXXXXXXX")" || { control_unlock; return 1; }
+  printf '%s\n' "$turn" > "$TURN_F"
   rm -f "$REC_WAV_F"
-  nohup pw-record ${MIC_TARGET:+--target "$MIC_TARGET"} --rate 16000 --channels 1 "$REC_WAV_F" >/dev/null 2>&1 &
-  echo $! > "$REC_PID_F"
+  ln -s "$turn/rec.wav" "$REC_WAV_F"
+  ( exec 9>&-; exec nohup pw-record ${MIC_TARGET:+--target "$MIC_TARGET"} --rate 16000 --channels 1 "$turn/rec.wav" ) >/dev/null 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" > "$REC_PID_F"
+  record_worker "$turn/recpid" "$pid"
   set_state listening
   cue message-new-instant
   if [ "$CLAWBAR_VAD" = "on" ]; then
@@ -174,24 +283,55 @@ start_rec() {
     notify "🎙 Escuchando… (apreta el atajo otra vez para enviar)"
   fi
   # hard safety cap: cut if you forget
-  ( sleep "$MAX_REC_SECS"; [ -f "$REC_PID_F" ] && kill -INT "$(cat "$REC_PID_F" 2>/dev/null)" 2>/dev/null ) >/dev/null 2>&1 &
+  (
+    exec 9>&-
+    trap 'flock -u 9 2>/dev/null || true; retire_worker "$turn" cap "$BASHPID"' EXIT
+    sleep "$MAX_REC_SECS"
+    control_lock
+    local saved stamp
+    read -r saved stamp 2>/dev/null < "$turn/recpid" || saved=""
+    if turn_valid "$turn" && [ "$saved" = "$pid" ] && [ -n "$stamp" ] &&
+       [ "$(process_stamp "$pid")" = "$stamp" ]; then
+      kill -INT "$pid" 2>/dev/null || true
+    fi
+    control_unlock
+  ) >/dev/null 2>&1 &
+  record_worker "$turn/cappid" "$!"
   # VAD watcher (background; calls stop_and_process itself on trailing silence)
   if [ "$CLAWBAR_VAD" = "on" ]; then
-    ( vad_watch ) >/dev/null 2>&1 &
+    ( exec 9>&-; vad_watch "$turn" ) >/dev/null 2>&1 &
+    vpid=$!
+    record_worker "$turn/vadpid" "$vpid"
+    printf '%s\n' "$vpid" > "$VAD_PID_F"
   fi
-}
+  control_unlock
+)
 
-stop_and_process() {
+stop_and_process() (
+  control_lock
+  local turn pid="" stamp=""; turn="$(cat "$TURN_F" 2>/dev/null)"
+  if [ -z "$turn" ] || { [ -n "${1:-}" ] && [ "$1" != "$turn" ]; }; then
+    control_unlock
+    return
+  fi
+  turn_valid "$turn" || { cancel_turn; control_unlock; return; }
   # single-shot guard: whoever grabs the busy dir first owns this turn
-  mkdir "$BUSY_D" 2>/dev/null || { notify "Estoy con el turno anterior, espera…"; return; }
-  trap 'rmdir "$BUSY_D" 2>/dev/null; set_state idle' RETURN
-  stop_vad
-  local pid; pid="$(cat "$REC_PID_F" 2>/dev/null)"; rm -f "$REC_PID_F"
-  [ -n "$pid" ] && kill -INT "$pid" 2>/dev/null
+  mkdir "$BUSY_D" 2>/dev/null || { control_unlock; notify "Estoy con el turno anterior, espera…"; return; }
+  trap 'finish_turn "$turn"' EXIT
+  stop_worker "$turn/cappid"
+  stop_worker "$turn/vadpid"
+  rm -f "$VAD_PID_F"
+  read -r pid stamp 2>/dev/null < "$turn/recpid" || true
+  rm -f "$REC_PID_F"
+  if [ -n "$pid" ] && [ -n "$stamp" ] && [ "$(process_stamp "$pid")" = "$stamp" ]; then
+    kill -INT "$pid" 2>/dev/null || true
+  fi
+  control_unlock
   sleep 0.4
-  [ -s "$REC_WAV_F" ] || { notify "No grabe nada (microfono?)"; set_state error; sleep 1; return; }
-  process_turn
-}
+  turn_valid "$turn" || return
+  [ -s "$turn/rec.wav" ] || { notify "No grabe nada (microfono?)"; set_turn_state "$turn" error; sleep 1; return; }
+  process_turn "$turn"
+)
 
 # ===========================================================================
 # screen capture
@@ -217,50 +357,58 @@ capture_screen() {  # $1 = png destination. Returns 0 if something was captured.
 # the turn: transcribe -> (look) -> think -> speak
 # ===========================================================================
 process_turn() {
-  resolve_audio
-  [ -n "$AUDIO_BASE" ] || { notify "No encuentro $AUDIO_CTR (sidecar caido?)"; set_state error; sleep 1; return; }
+  local turn="$1"
+  turn_valid "$turn" || return
+  resolve_audio "$turn"
+  turn_valid "$turn" || return
+  [ -n "$AUDIO_BASE" ] || { notify "No encuentro $AUDIO_CTR (sidecar caido?)"; set_turn_state "$turn" error; sleep 1; return; }
 
-  set_state transcribing
+  set_turn_state "$turn" transcribing || return
   notify "📝 Transcribiendo…"
   local txt
-  txt="$(curl -s -m 60 -X POST "$AUDIO_BASE/audio/transcriptions" \
-          -F "file=@$REC_WAV_F;type=audio/wav" -F "model=$STT_MODEL" \
+  txt="$(run_for_turn "$turn" curl -s -m 60 -X POST "$AUDIO_BASE/audio/transcriptions" \
+          -F "file=@$turn/rec.wav;type=audio/wav" -F "model=$STT_MODEL" \
           -F "language=$LANG_STT" -F "response_format=json" -F "prompt=$STT_PROMPT" \
         | jq -r '.text // empty' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  [ -n "$txt" ] || { notify "No te entendi, proba de nuevo."; cue dialog-error; set_state error; sleep 1; return; }
+  turn_valid "$turn" || return
+  [ -n "$txt" ] || { notify "No te entendi, proba de nuevo."; cue dialog-error; set_turn_state "$turn" error; sleep 1; return; }
   notify "🗣 Vos: $txt"
 
   local msg="$txt"
   if [ ! -f "$EYES_OFF_F" ] && printf '%s' "$txt" | grep -qiE "$SCREEN_REGEX"; then
-    set_state looking
+    set_turn_state "$turn" looking || return
     notify "👁 Mirando la pantalla…"
-    if capture_screen "$SHOT_HOSTDIR/screen.png"; then
+    if run_for_turn "$turn" capture_screen "$SHOT_HOSTDIR/screen.png"; then
       msg="[El usuario te habla por voz desde el escritorio. Adjunto una captura de su pantalla en \"$SHOT_AGENTREL\" (dentro de tu workspace). Abrila como IMAGEN con tu herramienta Read y respondé segun lo que veas. Consulta del usuario:]
 
 $txt"
     fi
   fi
+  turn_valid "$turn" || return
 
-  set_state thinking
+  set_turn_state "$turn" thinking || return
   notify "🤔 Pensando…"
   local reply
-  reply="$(docker exec "$CLAW_CTR" openclaw agent --agent "$AGENT" \
+  reply="$(run_for_turn "$turn" docker exec "$CLAW_CTR" openclaw agent --agent "$AGENT" \
             --session-id "$SESSION" --thinking "$THINKING" --timeout "$AGENT_TIMEOUT" \
             -m "$msg" --json 2>/dev/null \
           | jq -r '.result.payloads[]?.text // empty' | sed '/^[[:space:]]*$/d')"
-  [ -n "$reply" ] || { notify "El agente no devolvio texto."; cue dialog-error; set_state error; sleep 1; return; }
+  turn_valid "$turn" || return
+  [ -n "$reply" ] || { notify "El agente no devolvio texto."; cue dialog-error; set_turn_state "$turn" error; sleep 1; return; }
   notify "💬 Claw: $(printf '%s' "$reply" | head -c 240)"
 
   # speak (Kokoro -> wav -> default sink)
-  set_state speaking
+  set_turn_state "$turn" speaking || return
   local say wav; say="$(printf '%s' "$reply" | head -c "$SPEAK_MAXCHARS")"
   wav="$(mktemp --suffix=.wav)"
-  curl -s -m 120 -X POST "$AUDIO_BASE/audio/speech" -H 'Content-Type: application/json' \
+  run_for_turn "$turn" curl -s -m 120 -X POST "$AUDIO_BASE/audio/speech" -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg m "$TTS_MODEL" --arg v "$VOICE" --arg i "$say" \
           '{model:$m,voice:$v,input:$i,response_format:"wav"}')" -o "$wav"
-  if [ -s "$wav" ]; then paplay "$wav" 2>/dev/null || pw-play "$wav" 2>/dev/null; fi
+  if turn_valid "$turn" && [ -s "$wav" ]; then
+    run_for_turn "$turn" paplay "$wav" 2>/dev/null || run_for_turn "$turn" pw-play "$wav" 2>/dev/null
+  fi
   rm -f "$wav"
-  # RETURN trap restores idle state
+  # The turn owner's EXIT trap restores idle state and discards its WAV.
 }
 
 # ===========================================================================
@@ -271,10 +419,13 @@ case "${1:-toggle}" in
   start)  start_rec ;;
   stop)   stop_and_process ;;
   state)  cat "$STATE_FILE" 2>/dev/null || echo idle ;;
-  mute)   case "${2:-toggle}" in
+  mute)   control_lock
+          case "${2:-toggle}" in
             on) : > "$MUTED_F" ;; off) rm -f "$MUTED_F" ;;
             *) if [ -f "$MUTED_F" ]; then rm -f "$MUTED_F"; else : > "$MUTED_F"; fi ;;
           esac
+          [ ! -f "$MUTED_F" ] || cancel_turn
+          control_unlock
           [ -f "$MUTED_F" ] && notify "🔇 Mic muteado" || notify "🎙 Mic activo"
           pkill "-RTMIN+${CLAWBAR_WAYBAR_SIGNAL}" waybar 2>/dev/null || true ;;
   eyes)   case "${2:-toggle}" in
@@ -283,7 +434,10 @@ case "${1:-toggle}" in
           esac
           [ -f "$EYES_OFF_F" ] && notify "🙈 Ojos tapados" || notify "👁 Ojos abiertos"
           pkill "-RTMIN+${CLAWBAR_WAYBAR_SIGNAL}" waybar 2>/dev/null || true ;;
-  privacy) : > "$MUTED_F"; : > "$EYES_OFF_F"; notify "🕶 Privacidad: mic + ojos OFF"
+  privacy) control_lock
+          : > "$MUTED_F"; : > "$EYES_OFF_F"; cancel_turn
+          control_unlock
+          notify "🕶 Privacidad: mic + ojos OFF"
           pkill "-RTMIN+${CLAWBAR_WAYBAR_SIGNAL}" waybar 2>/dev/null || true ;;
   say)    resolve_audio; w="$(mktemp --suffix=.wav)"
           curl -s -X POST "$AUDIO_BASE/audio/speech" -H 'Content-Type: application/json' \
