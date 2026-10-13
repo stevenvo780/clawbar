@@ -72,7 +72,8 @@ def validate(path):
 
 
 def has_definition(text):
-    return re.search(r'"custom/claw"\s*:', text) is not None
+    # A commented-out example must not suppress the live definition.
+    return re.search(r'"custom/claw"\s*:', strip_jsonc(text)) is not None
 
 
 def build_definition_block(indent="    "):
